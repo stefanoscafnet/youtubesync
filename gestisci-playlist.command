@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync Gestisci playlist v1 — ScafNet
+# YouTubeSync Gestisci playlist v2 — ScafNet
+# v2: corretti i nomi tra « » (bash del Mac) e la lettura della risposta del foglio.
 # Per Max: aggiungere, togliere e vedere le playlist sincronizzate,
 # con le finestre normali del Mac. Le modifiche vanno nel foglio
 # Google di Stefano (che le vede anche nel foglio Log).
@@ -80,7 +81,9 @@ load_list() {   # righe: id <TAB> nome <TAB> link
   grep -q $'\t' "$LIST_FILE" || [ ! -s "$LIST_FILE" ]
 }
 name_of() { awk -F'\t' -v id="$1" '$1==id { print ($2!="" ? $2 : $1); exit }' "$LIST_FILE"; }
-post() { curl -fsS --max-time 30 -X POST "$ENDPOINT_URL" "$@" 2>/dev/null; }
+# niente -X POST: con --data curl fa POST e, sul reindirizzamento di Google, prosegue in GET
+# e legge la risposta vera ("OK", "GIA_PRESENTE", ...)
+post() { curl -fsSL --max-time 30 "$ENDPOINT_URL" "$@" 2>/dev/null; }
 
 # ---------- controlli iniziali ----------
 if ! printf '%s' "$ENDPOINT_URL" | grep -q '^https'; then
@@ -134,19 +137,19 @@ Di solito succede quando e' «Privata». Su YouTube apri la playlist, cambia la 
   fi
   [ "$(ask_buttons "Ho trovato:
 
-«$title»
+«${title}»
 $count brani
 
 La aggiungo alla sincronizzazione?" "Annulla" "Aggiungi" "Aggiungi")" = "Aggiungi" ] || return
   resp=$(post --data-urlencode "action=add" --data-urlencode "link=https://www.youtube.com/playlist?list=$id" --data-urlencode "name=$title")
   case "$resp" in
     OK)
-      if [ "$(ask_buttons "Fatto! «$title» e' stata aggiunta.
+      if [ "$(ask_buttons "Fatto! «${title}» e' stata aggiunta.
 
 I brani verranno scaricati alla prossima sincronizzazione." "Piu' tardi" "Sincronizza adesso" "Sincronizza adesso")" = "Sincronizza adesso" ]; then
         open "$SYNC_SCRIPT"; close_terminal; exit 0
       fi ;;
-    GIA_PRESENTE) info "La playlist «$title» e' gia' nell'elenco." ;;
+    GIA_PRESENTE) info "La playlist «${title}» e' gia' nell'elenco." ;;
     *) info "Non sono riuscito a salvarla. Controlla internet e riprova; se continua, chiama Stefano." ;;
   esac
 }
@@ -167,7 +170,7 @@ do_remove() {
     if [ "${items[$i]}" = "$sel" ]; then id="${ids[$i]}"; break; fi
   done
   [ -z "$id" ] && return
-  [ "$(ask_buttons "Togliere «$sel» dalla sincronizzazione?
+  [ "$(ask_buttons "Togliere «${sel}» dalla sincronizzazione?
 
 I brani gia' scaricati restano sul Mac." "Annulla" "Togli" "Annulla")" = "Togli" ] || return
   resp=$(post --data-urlencode "action=remove" --data-urlencode "listid=$id")
@@ -179,7 +182,7 @@ I brani gia' scaricati restano sul Mac." "Annulla" "Togli" "Annulla")" = "Togli"
   n_same=$(awk -F'\t' -v n="$sel" -v id="$id" '$2==n && $1!=id' "$LIST_FILE" | wc -l | tr -d ' ')
   case "$sel" in ""|_*|*/*) folder="" ;; esac
   if [ -n "$folder" ] && [ -d "$folder" ] && [ "$n_same" -eq 0 ]; then
-    if [ "$(ask_buttons "Fatto: «$sel» non verra' piu' sincronizzata.
+    if [ "$(ask_buttons "Fatto: «${sel}» non verra' piu' sincronizzata.
 
 Vuoi spostare anche la sua cartella nel Cestino? (Se cambi idea la recuperi dal Cestino.)" "Sposta nel Cestino" "Tienila" "Tienila")" = "Sposta nel Cestino" ]; then
       trash_dest="$HOME/.Trash/$sel"
@@ -192,12 +195,12 @@ on run argv
 end run
 EOF
       fi
-      if [ ! -d "$folder" ]; then info "Cartella «$sel» spostata nel Cestino."
+      if [ ! -d "$folder" ]; then info "Cartella «${sel}» spostata nel Cestino."
       else info "Non sono riuscito a spostare la cartella. Puoi trascinarla nel Cestino tu dalla cartella Musica > Youtube."
       fi
     fi
   else
-    info "Fatto: «$sel» non verra' piu' sincronizzata."
+    info "Fatto: «${sel}» non verra' piu' sincronizzata."
   fi
 }
 

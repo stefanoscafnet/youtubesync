@@ -1,7 +1,11 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v17 — ScafNet
-# NOVITA' rispetto alla v16:
+# YouTubeSync v18 — ScafNet
+# NOVITA' rispetto alla v17:
+#  - Nella schermata finale, elenco dei brani che non esistono piu' su
+#    YouTube, divisi per playlist, con il link da aprire (Cmd + doppio clic).
+#  - Corretto il nome delle playlist non raggiungibili nel log (« »).
+# Dalla v17:
 #  - Max gestisce da solo le playlist: lo script installa e tiene
 #    aggiornato "Gestisci playlist.command" (aggiungi / togli / vedi)
 #    accanto a se stesso. Le modifiche passano dal foglio di Stefano.
@@ -36,7 +40,7 @@
 #  - Resta: AUTO-AGGIORNANTE da GitHub, log completo a Stefano.
 # ============================================================
 
-APP_VERSION="v17"
+APP_VERSION="v18"
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -279,7 +283,7 @@ while IFS= read -r raw_line <&3; do
   yt_count=$(wc -l < "$CUR" | tr -d ' ')
 
   if [ -z "$folder_name" ] || [ "$folder_name" = "NA" ]; then
-    log "playlist non raggiungibile: «$known_name» $playlist_url"
+    log "playlist non raggiungibile: «${known_name}» $playlist_url"
     UNREACHABLE=$((UNREACHABLE + 1))
     printf 'UNREACH\t%s\t-\t-\t0\n' "$known_name" >> "$RPT"
     continue
@@ -417,7 +421,10 @@ while IFS= read -r raw_line <&3; do
   while IFS= read -r id; do
     [ -z "$id" ] && continue
     t=$(awk -F'\t' -v id="$id" '$2==id { print $3; exit }' "$META")
-    if grep -qxF -- "$id" "$DEADIDS"; then why="non esiste piu'"; else why="bloccato"; fi
+    if grep -qxF -- "$id" "$DEADIDS"; then
+      why="non esiste piu'"
+      printf '%s\t%s\t%s\n' "$folder_name" "$t" "$id" >> "$WORK/deadlist"
+    else why="bloccato"; fi
     log "   manca in \"$folder_name\": https://youtu.be/$id  ($why)  $t"
   done < "$MISS"
   MISSING_OTHER=$((MISSING_OTHER + miss_n - miss_dead))
@@ -499,6 +506,14 @@ fi
 if [ "$MISSING_DEAD" -gt 0 ]; then
   printf '\n      *  Brani che non esistono piu'\'' su YouTube:  %d\n' "$MISSING_DEAD"
   printf '         Normale, non si possono recuperare.\n'
+  if [ -s "$WORK/deadlist" ]; then
+    printf '         Per aprire un link: tieni premuto ⌘ e fai doppio clic.\n'
+    awk -F'\t' '
+      $1 != last { printf "\n         %s\n", $1; last = $1 }
+      { t = $2; if (t == "" || t == "NA") t = "(titolo non piu'\'' disponibile)"
+        if (length(t) > 60) t = substr(t, 1, 59) "~"
+        printf "           • %s\n             https://youtu.be/%s\n", t, $3 }' "$WORK/deadlist"
+  fi
 fi
 if [ "$MISSING_OTHER" -gt 0 ]; then
   printf '\n      ⚠  Brani non scaricati per ora:  %d\n' "$MISSING_OTHER"
