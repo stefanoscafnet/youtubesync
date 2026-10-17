@@ -1,28 +1,33 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v14 — ScafNet
-# NOVITA' rispetto alla v13: INTERFACCIA "APP" PER MAX.
-#  - Max vede: versione, barra di avanzamento, playlist in corso,
-#    contatore brani nuovi; a fine sync una tabella pulita
-#    (YouTube vs Mac) con ✓/⚠, totali ed eventuali non scaricati.
-#  - Tutto l'output tecnico di yt-dlp e' nascosto e finisce SOLO
-#    nel log completo inviato a Stefano (Google Sheet), inclusi i
-#    titoli dei brani falliti.
-#  - Resta: AUTO-AGGIORNANTE da GitHub, classificazione falliti
-#    (morti/signin/403/429), _RIMOSSI unica, riallineamento
-#    archivio, fix grep "--", config locale.
+# YouTubeSync v15 — ScafNet
+# NOVITA' rispetto alla v14:
+#  - CARTELLE COMPLETE: ogni cartella playlist contiene TUTTI i suoi
+#    brani. Un brano presente in piu' playlist si scarica una volta
+#    sola e nelle altre cartelle viene messo come "clone" APFS
+#    (cp -c): zero spazio in piu', nessun nuovo download.
+#  - Lo stato si legge dai FILE su disco (non piu' dall'archivio):
+#    per ogni playlist si scaricano esattamente i brani mancanti.
+#  - Una sola lettura della playlist da YouTube (prima erano 3).
+#  - yt-dlp si aggiorna da solo (al massimo una volta al giorno).
+#  - Rimozioni: se il brano tolto esiste ancora in un'altra cartella
+#    si toglie solo il doppione; se era l'unica copia va in _RIMOSSI.
+#  - UI: barra ASCII, schermo pulito (niente schermate accumulate),
+#    ✓ / ✓* / ⚠ veritieri, messaggi distinti per video morti e bloccati.
+#  - Resta: AUTO-AGGIORNANTE da GitHub, log completo a Stefano.
 # ============================================================
 
-APP_VERSION="v14"
+APP_VERSION="v15"
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export LC_COLLATE=C   # ordinamento coerente per sort/comm
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 SELF_PATH="$SELF_DIR/$(basename "$0")"
 CONFIG_FILE="$SELF_DIR/config.sh"
 
-# --- AUTO-UPDATE DA GITHUB (silenzioso) ---
+# --- AUTO-UPDATE DELLO SCRIPT DA GITHUB (silenzioso) ---
 if [ -z "$YTS_SELFUPDATE_DONE" ] && printf '%s' "$GHRAW" | grep -q "^https"; then
   NEW="$(mktemp)"
   if curl -fsSL "$GHRAW" -o "$NEW" 2>/dev/null \
@@ -43,75 +48,98 @@ fi
 
 # --- CONFIG ---
 DEST_FOLDER="$HOME/Music/Youtube"
-ARCHIVE_FILE="$DEST_FOLDER/archive_global.txt"
 LOG_FILE="$DEST_FOLDER/youtube_sync.log"
 PLAYLIST_CACHE="$DEST_FOLDER/playlist_cache.txt"
 PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
-REMOVED_DIRNAME="_RIMOSSI"
-REMOVED_FOLDER="$DEST_FOLDER/$REMOVED_DIRNAME"
+REMOVED_FOLDER="$DEST_FOLDER/_RIMOSSI"
+YTDLP_STAMP="$DEST_FOLDER/.ytdlp_update_stamp"
+LOG_KEEP_LINES=5000
 
 YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3)
 YT_META_OPTS=(--retries 5 --extractor-retries 3)
 
 # --- STATO ---
-ANY_NEW=false; ANY_REMOVED=false; ANY_RESTORED=false
 VALID_PLAYLISTS=0; SKIPPED_LINES=0; UNREACHABLE=0
-TOTAL_REMOVED=0; TOTAL_RESTORED=0; TOTAL_DLERR=0; TOTAL_NEW=0
-DEAD=0; BOT=0; E403=0; E429=0
+TOTAL_NEW=0; TOTAL_CLONED=0; TOTAL_RESTORED=0; TOTAL_REMOVED=0; TOTAL_DUPDEL=0
+TOTAL_DLERR=0; DEAD=0; BOT=0; E403=0; E429=0
+MISSING_DEAD=0; MISSING_OTHER=0
 START_TIME=$(date +%s)
 
 mkdir -p "$DEST_FOLDER"
-RUN_LOG=$(mktemp)      # log tecnico completo -> Stefano
-RPT=$(mktemp)          # righe tabella finale -> Max
+WORK=$(mktemp -d)
+RUN_LOG="$WORK/run.log"; RPT="$WORK/report.tsv"; INDEX="$WORK/index.tsv"
+: > "$RUN_LOG"; : > "$RPT"
 
-# log tecnico: SOLO su file (non a schermo). A schermo parla la UI.
 log() {
   local line="$(date '+%Y-%m-%d %H:%M:%S') $*"
   echo "$line" >> "$LOG_FILE"
   echo "$line" >> "$RUN_LOG"
 }
 
-extract_id_from_filename() {
-  local name="$1"
-  if [[ "$name" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  fi
+# ---------- INDICE DEI FILE (id <TAB> percorso) ----------
+build_index() {
+  find "$DEST_FOLDER" -type f -name '*].mp3' 2>/dev/null | while IFS= read -r p; do
+    b="${p##*/}"
+    if [[ "$b" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
+      printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$p"
+    fi
+  done > "$INDEX"
+}
+# ID presenti in una cartella (solo primo livello), ordinati
+ids_in_folder() {
+  find "$1" -maxdepth 1 -type f -name '*].mp3' 2>/dev/null \
+    | sed -nE 's/.*\[([A-Za-z0-9_-]{11})\]\.mp3$/\1/p' | sort -u
+}
+# sorgente per un id mancante in $2: prima un'altra cartella playlist, poi _RIMOSSI
+find_src() {
+  awk -F'\t' -v id="$1" -v F="$2/" -v R="$REMOVED_FOLDER/" '
+    $1==id && index($2,F)!=1 {
+      if (index($2,R)==1) { if (r=="") r=$2 }
+      else { print $2; found=1; exit }
+    }
+    END { if (!found && r!="") print r }' "$INDEX"
+}
+# esiste una copia dell'id fuori da $2 e fuori da _RIMOSSI?
+other_copy() {
+  awk -F'\t' -v id="$1" -v F="$2/" -v R="$REMOVED_FOLDER/" '
+    $1==id && index($2,F)!=1 && index($2,R)!=1 { print $2; exit }' "$INDEX"
 }
 
 # ---------- INTERFACCIA ----------
-UI_LINE='   ──────────────────────────────────────────'
+UI_LINE='   ------------------------------------------------'
 draw_header() {
-  printf '\033[2J\033[H\n'
-  printf '   ════════════════════════════════════════════\n'
+  printf '\033[2J\033[3J\033[H\n'
+  printf '   ================================================\n'
   printf '      🎵  YouTubeSync      %s\n' "$APP_VERSION"
-  printf '   ════════════════════════════════════════════\n\n'
+  printf '   ================================================\n\n'
 }
 draw_progress() {
-  # $1 idx  $2 total  $3 nome playlist  $4 nuovi finora
-  local idx=$1 total=$2 name=$3 newc=$4
-  local bl=26 f=0 i=0 bar=""
+  # $1 idx  $2 total  $3 playlist  $4 fase
+  local idx=$1 total=$2 name=$3 stage=$4
+  local bl=30 f=0 i=0 bar=""
   [ "$total" -gt 0 ] && f=$(( idx * bl / total ))
   [ "$f" -gt "$bl" ] && f=$bl
-  while [ $i -lt $f ];  do bar="$bar█"; i=$((i+1)); done
-  while [ $i -lt $bl ]; do bar="$bar░"; i=$((i+1)); done
+  while [ $i -lt $f ];  do bar="$bar#"; i=$((i+1)); done
+  while [ $i -lt $bl ]; do bar="$bar."; i=$((i+1)); done
   draw_header
-  printf '      Sincronizzazione in corso…\n\n'
-  printf '      [%s]   %d / %d\n\n' "$bar" "$idx" "$total"
-  printf '      ▶  %s\n\n' "$name"
-  printf '      Brani nuovi scaricati finora:  %d\n' "$newc"
-  printf '\n\n      (puoi lasciare la finestra aperta, ci penso io)\n'
+  printf '      Sincronizzazione in corso...\n\n'
+  printf '      [%s]  %d / %d\n\n' "$bar" "$idx" "$total"
+  printf '      >  %s\n' "$name"
+  printf '         %s\n\n' "$stage"
+  printf '      Brani nuovi scaricati:  %d\n' "$TOTAL_NEW"
+  [ "$TOTAL_CLONED" -gt 0 ] && printf '      Brani aggiunti da altre playlist:  %d\n' "$TOTAL_CLONED"
+  printf '\n\n      (lascia pure la finestra aperta, ci penso io)\n'
 }
+draw_simple() { draw_header; printf '      %s\n' "$1"; }
 
-draw_header
-printf '      Avvio in corso…\n'
-
+draw_simple "Avvio in corso..."
 osascript -e 'display notification "Sincronizzazione avviata" with title "YouTubeSync"' 2>/dev/null
 log "inizio sincronizzazione ($APP_VERSION)"
 
 # --- CHECK DIPENDENZE ---
 missing=""
-command -v yt-dlp  >/dev/null 2>&1 || missing="yt-dlp"
-command -v ffmpeg  >/dev/null 2>&1 || missing="${missing:+$missing, }ffmpeg"
+command -v yt-dlp >/dev/null 2>&1 || missing="yt-dlp"
+command -v ffmpeg >/dev/null 2>&1 || missing="${missing:+$missing, }ffmpeg"
 if [ -n "$missing" ]; then
   draw_header
   printf '      ⚠  Manca un componente (%s).\n\n      Chiama Stefano.\n\n' "$missing"
@@ -121,21 +149,17 @@ if [ -n "$missing" ]; then
 fi
 command -v deno >/dev/null 2>&1 || log "AVVISO deno non trovato — alcuni video potrebbero fallire (JS challenge)"
 
-# --- RIALLINEAMENTO ARCHIVIO DAI FILE GIA' PRESENTI ---
-touch "$ARCHIVE_FILE"
-EXIST_IDS=$(mktemp); ARCH_IDS=$(mktemp)
-find "$DEST_FOLDER" -type f -name "*].mp3" ! -path "$REMOVED_FOLDER/*" 2>/dev/null \
-  | grep -oE '\[[A-Za-z0-9_-]{11}\]\.mp3$' | sed -E 's/^\[//; s/\]\.mp3$//' | sort -u > "$EXIST_IDS"
-awk '/^youtube /{print $2}' "$ARCHIVE_FILE" | sort -u > "$ARCH_IDS"
-added=0
-while IFS= read -r id; do
-  [ -z "$id" ] && continue
-  if ! grep -qx -- "$id" "$ARCH_IDS"; then
-    echo "youtube $id" >> "$ARCHIVE_FILE"; added=$((added + 1))
+# --- AGGIORNAMENTO yt-dlp (max 1 volta al giorno) ---
+if command -v brew >/dev/null 2>&1; then
+  if [ ! -f "$YTDLP_STAMP" ] || [ -n "$(find "$YTDLP_STAMP" -mtime +0 2>/dev/null)" ]; then
+    draw_simple "Controllo aggiornamenti..."
+    log "aggiornamento yt-dlp (brew)"
+    HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade yt-dlp </dev/null >>"$RUN_LOG" 2>&1
+    touch "$YTDLP_STAMP"
   fi
-done < "$EXIST_IDS"
-rm -f "$EXIST_IDS" "$ARCH_IDS"
-[ "$added" -gt 0 ] && log "archivio riallineato: +$added id dai file esistenti"
+fi
+YTDLP_VER=$(yt-dlp --version 2>/dev/null | head -n1)
+log "yt-dlp versione: ${YTDLP_VER:-sconosciuta}"
 
 # --- LISTA PLAYLIST (web -> cache -> locale) ---
 PLAYLIST_FILE=""
@@ -155,133 +179,163 @@ if [ -z "$PLAYLIST_FILE" ]; then
   osascript -e 'display notification "Non trovo la lista playlist. Chiama Stefano." with title "YouTubeSync"' 2>/dev/null
   log "ERRORE nessuna lista playlist disponibile."
   [ -n "$ENDPOINT_URL" ] && curl -fsS -X POST "$ENDPOINT_URL" --data-urlencode "summary=ERRORE: nessuna lista playlist" --data-urlencode "detail@$RUN_LOG" >/dev/null 2>&1
-  rm -f "$RUN_LOG" "$RPT"; exit 1
+  rm -rf "$WORK"; exit 1
 fi
 
 TOTAL_PL=$(grep -cE 'list=' "$PLAYLIST_FILE"); [ "$TOTAL_PL" -eq 0 ] && TOTAL_PL=1
 idx=0
+build_index
 
-# --- LOOP PLAYLIST ---
-while IFS= read -r raw_line; do
+# --- LOOP PLAYLIST (lista letta da fd 3, cosi' nessun comando interno la "mangia") ---
+while IFS= read -r raw_line <&3; do
 
   listid=$(printf '%s' "$raw_line" | grep -oE 'list=[A-Za-z0-9_-]+' | head -n1 | cut -d= -f2)
   if [ -z "$listid" ]; then SKIPPED_LINES=$((SKIPPED_LINES + 1)); continue; fi
   idx=$((idx + 1))
-
   playlist_url="https://www.youtube.com/playlist?list=$listid"
 
-  draw_progress "$idx" "$TOTAL_PL" "collegamento a YouTube…" "$TOTAL_NEW"
+  draw_progress "$idx" "$TOTAL_PL" "playlist $idx" "lettura da YouTube..."
 
-  folder_name=$(yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --playlist-items 1 --print "%(playlist_title)s" "$playlist_url" 2>/dev/null | head -n 1)
-  if [ -z "$folder_name" ]; then
+  # UNA sola lettura: titolo + id di tutti i brani
+  META="$WORK/meta"; CUR="$WORK/cur"
+  yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print $'%(playlist_title)s\t%(id)s' "$playlist_url" </dev/null 2>/dev/null > "$META"
+  folder_name=$(head -n1 "$META" | cut -f1)
+  cut -f2 "$META" | grep -E '^[A-Za-z0-9_-]{11}$' | sort -u > "$CUR"
+  yt_count=$(wc -l < "$CUR" | tr -d ' ')
+
+  if [ -z "$folder_name" ] || [ "$folder_name" = "NA" ]; then
     log "playlist non raggiungibile: $playlist_url"
     UNREACHABLE=$((UNREACHABLE + 1))
-    printf 'UNREACH\t%s\t-\t-\t0\n' "playlist #$idx (non raggiungibile)" >> "$RPT"
+    printf 'UNREACH\t%s\t-\t-\t0\n' "playlist n.$idx (non raggiungibile)" >> "$RPT"
     continue
   fi
 
   VALID_PLAYLISTS=$((VALID_PLAYLISTS + 1))
-  playlist_folder="$DEST_FOLDER/$folder_name"
-  mkdir -p "$playlist_folder"
-  draw_progress "$idx" "$TOTAL_PL" "$folder_name" "$TOTAL_NEW"
-  log "sync: $folder_name"
+  F="$DEST_FOLDER/$folder_name"
+  mkdir -p "$F"
+  log "sync: $folder_name ($yt_count brani su YouTube)"
 
-  # FASE 0 — RIPRISTINO da _RIMOSSI
-  if [ -d "$REMOVED_FOLDER" ]; then
-    CUR0=$(mktemp)
-    yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR0"
-    if [ -s "$CUR0" ]; then
-      for file in "$REMOVED_FOLDER"/*.mp3; do
-        [ ! -e "$file" ] && continue
-        base=$(basename "$file"); fid=$(extract_id_from_filename "$base"); [ -z "$fid" ] && continue
-        if grep -Fxq -- "$fid" "$CUR0" && [ ! -e "$playlist_folder/$base" ]; then
-          mv "$file" "$playlist_folder/"; echo "youtube $fid" >> "$ARCHIVE_FILE"
-          log "   ripristinato da _RIMOSSI: $base -> $folder_name"
-          TOTAL_RESTORED=$((TOTAL_RESTORED + 1)); ANY_RESTORED=true
-        fi
-      done
-    fi
-    rm -f "$CUR0"
-  fi
-
-  # FASE 1 — DOWNLOAD (silenzioso; errori -> ERRLOG, classificati)
-  cd "$playlist_folder" || continue
-  before=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
-  ERRLOG=$(mktemp)
-  yt-dlp \
-    --quiet --no-warnings --yes-playlist --ignore-errors --no-overwrites \
-    "${YT_NET_OPTS[@]}" \
-    --extract-audio --audio-format mp3 --audio-quality 0 \
-    --embed-thumbnail --add-metadata \
-    --download-archive "$ARCHIVE_FILE" \
-    --output "%(title)s [%(id)s].%(ext)s" \
-    "$playlist_url" >>"$RUN_LOG" 2>"$ERRLOG"
-  dlerr=$(grep -c '^ERROR:' "$ERRLOG" 2>/dev/null)
-  if [ "${dlerr:-0}" -gt 0 ]; then
-    d_dead=$(grep -ciE '^ERROR:.*(unavailable|private|removed|terminated|copyright|not available|no longer)' "$ERRLOG")
-    d_bot=$(grep -ciE '^ERROR:.*(sign in to confirm|not a bot|confirm you)' "$ERRLOG")
-    d_403=$(grep -ciE '^ERROR:.*(403|forbidden)' "$ERRLOG")
-    d_429=$(grep -ciE '^ERROR:.*(429|too many requests)' "$ERRLOG")
-    DEAD=$((DEAD + d_dead)); BOT=$((BOT + d_bot)); E403=$((E403 + d_403)); E429=$((E429 + d_429))
-    TOTAL_DLERR=$((TOTAL_DLERR + dlerr))
-    log "   $dlerr non scaricabili in \"$folder_name\" (morti:$d_dead signin:$d_bot 403:$d_403 429:$d_429)"
-    grep '^ERROR:' "$ERRLOG" | head -n 25 | sed 's/^/     /' >> "$RUN_LOG"
-  fi
-  rm -f "$ERRLOG"
-  after=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
-  new=$((after - before)); [ "$new" -lt 0 ] && new=0
-  if [ "$new" -gt 0 ]; then ANY_NEW=true; TOTAL_NEW=$((TOTAL_NEW + new)); log "nuovi in \"$folder_name\": $new"; fi
-  draw_progress "$idx" "$TOTAL_PL" "$folder_name" "$TOTAL_NEW"
-
-  # FASE 2 — RIMOZIONI -> _RIMOSSI
-  CUR=$(mktemp)
-  yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR"
-  yt_count=$(grep -cvE '^\s*$' "$CUR")
   if [ "$yt_count" -eq 0 ]; then
-    log "AVVISO lettura \"$folder_name\" a 0 brani: rimozioni SALTATE."
-    rm -f "$CUR"
-    yt_count="?"
-  else
-    for file in *.mp3; do
-      [ ! -e "$file" ] && continue
-      fid=$(extract_id_from_filename "$file")
-      if [ -z "$fid" ]; then log "   senza ID, ignorato: $file"; continue; fi
-      if ! grep -Fxq -- "$fid" "$CUR"; then
-        mkdir -p "$REMOVED_FOLDER"; mv -f "$file" "$REMOVED_FOLDER/"
-        if [ -f "$ARCHIVE_FILE" ]; then
-          grep -vxF -- "youtube $fid" "$ARCHIVE_FILE" > "${ARCHIVE_FILE}.tmp" 2>/dev/null && mv "${ARCHIVE_FILE}.tmp" "$ARCHIVE_FILE"
-        fi
-        log "   rimosso da \"$folder_name\" -> _RIMOSSI: $file"
-        TOTAL_REMOVED=$((TOTAL_REMOVED + 1)); ANY_REMOVED=true
+    log "AVVISO \"$folder_name\": letti 0 brani — playlist saltata per sicurezza."
+    mac_now=$(ids_in_folder "$F" | wc -l | tr -d ' ')
+    printf 'WARN\t%s\t?\t%s\t0\n' "$folder_name" "$mac_now" >> "$RPT"
+    continue
+  fi
+
+  HAVE="$WORK/have"; MISS="$WORK/miss"; DEADIDS="$WORK/deadids"
+  : > "$DEADIDS"
+
+  # FASE 1 — completa da altre cartelle (clone) o da _RIMOSSI (ripristino)
+  ids_in_folder "$F" > "$HAVE"
+  comm -23 "$CUR" "$HAVE" > "$MISS"
+  if [ -s "$MISS" ]; then
+    draw_progress "$idx" "$TOTAL_PL" "$folder_name" "controllo brani gia' presenti in altre playlist..."
+    while IFS= read -r id; do
+      src=$(find_src "$id" "$F")
+      [ -z "$src" ] && continue
+      [ -e "$src" ] || continue
+      case "$src" in
+        "$REMOVED_FOLDER"/*)
+          if mv "$src" "$F/"; then
+            TOTAL_RESTORED=$((TOTAL_RESTORED + 1)); log "   ripristinato da _RIMOSSI: ${src##*/}"
+          fi ;;
+        *)
+          if cp -c "$src" "$F/" 2>/dev/null || cp -p "$src" "$F/"; then
+            TOTAL_CLONED=$((TOTAL_CLONED + 1)); log "   copiato da altra playlist: ${src##*/}"
+          fi ;;
+      esac
+    done < "$MISS"
+  fi
+
+  # FASE 2 — scarica SOLO i brani ancora mancanti
+  ids_in_folder "$F" > "$HAVE"
+  comm -23 "$CUR" "$HAVE" > "$MISS"
+  new=0
+  n_miss=$(wc -l < "$MISS" | tr -d ' ')
+  if [ "$n_miss" -gt 0 ]; then
+    draw_progress "$idx" "$TOTAL_PL" "$folder_name" "scarico $n_miss brani..."
+    URLS="$WORK/urls"; ERRLOG="$WORK/err"
+    sed 's#^#https://www.youtube.com/watch?v=#' "$MISS" > "$URLS"
+    before=$(ids_in_folder "$F" | wc -l | tr -d ' ')
+    ( cd "$F" && yt-dlp \
+        --quiet --no-warnings --ignore-errors --no-overwrites \
+        "${YT_NET_OPTS[@]}" \
+        --extract-audio --audio-format mp3 --audio-quality 0 \
+        --embed-thumbnail --add-metadata \
+        --output "%(title)s [%(id)s].%(ext)s" \
+        -a "$URLS" </dev/null >>"$RUN_LOG" 2>"$ERRLOG" )
+    after=$(ids_in_folder "$F" | wc -l | tr -d ' ')
+    new=$((after - before)); [ "$new" -lt 0 ] && new=0
+    TOTAL_NEW=$((TOTAL_NEW + new))
+    [ "$new" -gt 0 ] && log "nuovi in \"$folder_name\": $new"
+
+    dlerr=$(grep -c '^ERROR:' "$ERRLOG" 2>/dev/null); dlerr=${dlerr:-0}
+    if [ "$dlerr" -gt 0 ]; then
+      DEADRE='^ERROR:.*(unavailable|private|removed|terminated|copyright|not available|no longer)'
+      d_dead=$(grep -ciE "$DEADRE" "$ERRLOG")
+      d_bot=$(grep -ciE '^ERROR:.*(sign in to confirm|not a bot|confirm you)' "$ERRLOG")
+      d_403=$(grep -ciE '^ERROR:.*(403|forbidden)' "$ERRLOG")
+      d_429=$(grep -ciE '^ERROR:.*(429|too many requests)' "$ERRLOG")
+      DEAD=$((DEAD + d_dead)); BOT=$((BOT + d_bot)); E403=$((E403 + d_403)); E429=$((E429 + d_429))
+      TOTAL_DLERR=$((TOTAL_DLERR + dlerr))
+      grep -iE "$DEADRE" "$ERRLOG" | sed -nE 's/^ERROR: \[[^]]*\] ([A-Za-z0-9_-]{11}):.*/\1/p' | sort -u > "$DEADIDS"
+      log "   $dlerr non scaricabili in \"$folder_name\" (morti:$d_dead signin:$d_bot 403:$d_403 429:$d_429)"
+      grep '^ERROR:' "$ERRLOG" | head -n 40 | sed 's/^/     /' >> "$RUN_LOG"
+    fi
+  fi
+
+  # FASE 3 — brani tolti dalla playlist
+  draw_progress "$idx" "$TOTAL_PL" "$folder_name" "riordino..."
+  build_index
+  ids_in_folder "$F" > "$HAVE"
+  comm -13 "$CUR" "$HAVE" > "$MISS"     # qui: id presenti in cartella ma non piu' in playlist
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    find "$F" -maxdepth 1 -type f -name "*\[$id\].mp3" 2>/dev/null | while IFS= read -r file; do
+      other=$(other_copy "$id" "$F")
+      if [ -n "$other" ] && [ -e "$other" ]; then
+        rm -f "$file" && od="${other%/*}"; log "   tolto doppione (resta in ${od##*/}): ${file##*/}" && echo D >> "$WORK/cnt"
+      else
+        mkdir -p "$REMOVED_FOLDER"
+        mv -f "$file" "$REMOVED_FOLDER/" && log "   rimosso da \"$folder_name\" -> _RIMOSSI: ${file##*/}" && echo R >> "$WORK/cnt"
       fi
     done
-    rm -f "$CUR"
-  fi
+  done < "$MISS"
+  build_index
 
-  # riga per la tabella finale
-  mac_count=$(ls -1 "$playlist_folder"/*.mp3 2>/dev/null | wc -l | tr -d ' ')
-  status="OK"
-  if [ "$yt_count" != "?" ] && [ "$mac_count" -lt "$yt_count" ]; then status="WARN"; fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "$status" "$folder_name" "$yt_count" "$mac_count" "$new" >> "$RPT"
+  # riga tabella finale
+  ids_in_folder "$F" > "$HAVE"
+  mac_count=$(comm -12 "$CUR" "$HAVE" | wc -l | tr -d ' ')
+  comm -23 "$CUR" "$HAVE" > "$MISS"
+  miss_n=$(wc -l < "$MISS" | tr -d ' ')
+  miss_dead=$(comm -12 "$MISS" "$DEADIDS" | wc -l | tr -d ' ')
+  MISSING_DEAD=$((MISSING_DEAD + miss_dead))
+  MISSING_OTHER=$((MISSING_OTHER + miss_n - miss_dead))
+  if [ "$miss_n" -eq 0 ]; then st="OK"
+  elif [ "$miss_n" -eq "$miss_dead" ]; then st="DEAD"
+  else st="WARN"; fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$st" "$folder_name" "$yt_count" "$mac_count" "$miss_dead" >> "$RPT"
 
-done < <(grep -vE '^\s*$|^\s*#' "$PLAYLIST_FILE")
+done 3< <(grep -vE '^\s*$|^\s*#' "$PLAYLIST_FILE")
 
-# --- TEMPO / SUMMARY TECNICO ---
+[ -f "$WORK/cnt" ] && { TOTAL_DUPDEL=$(grep -c D "$WORK/cnt"); TOTAL_REMOVED=$(grep -c R "$WORK/cnt"); }
+
+# --- SUMMARY TECNICO ---
 END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 OTHER=$((TOTAL_DLERR - DEAD - BOT - E403 - E429)); [ "$OTHER" -lt 0 ] && OTHER=0
-SUMMARY="Sync $APP_VERSION — playlist:$VALID_PLAYLISTS, nuovi_tot:$TOTAL_NEW, rimossi:$TOTAL_REMOVED, ripristinati:$TOTAL_RESTORED, video_falliti:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
-[ "$UNREACHABLE" -gt 0 ] && SUMMARY="ATTENZIONE $SUMMARY"
+SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW, copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
+{ [ "$UNREACHABLE" -gt 0 ] || [ "$MISSING_OTHER" -gt 0 ]; } && SUMMARY="ATTENZIONE $SUMMARY"
 log "durata: ${DMIN}m ${DSEC}s"
 log "fine — $SUMMARY"
-
-# tabella anche nel log tecnico (per Stefano)
 {
-  echo "---- RIEPILOGO PLAYLIST (YouTube / Mac / nuovi) ----"
-  awk -F'\t' '{printf "  [%-6s] %-28s yt:%-4s mac:%-4s nuovi:%s\n",$1,$2,$3,$4,$5}' "$RPT"
-  echo "----------------------------------------------------"
+  echo "---- RIEPILOGO PLAYLIST (stato / YouTube / Mac / mancanti morti) ----"
+  awk -F'\t' '{printf "  [%-7s] %-30s yt:%-4s mac:%-4s morti:%s\n",$1,$2,$3,$4,$5}' "$RPT"
+  echo "--------------------------------------------------------------------"
 } >> "$RUN_LOG"
 echo "----------------------------------------" >> "$LOG_FILE"
+# il log locale non cresce all'infinito
+tail -n "$LOG_KEEP_LINES" "$LOG_FILE" > "$WORK/logtrim" 2>/dev/null && cat "$WORK/logtrim" > "$LOG_FILE"
 
 # --- INVIO LOG COMPLETO A STEFANO ---
 if printf '%s' "$ENDPOINT_URL" | grep -q "^https"; then
@@ -293,40 +347,45 @@ fi
 
 # ---------- SCHERMATA FINALE PER MAX ----------
 draw_header
-if [ "$TOTAL_DLERR" -gt 0 ] || [ "$UNREACHABLE" -gt 0 ]; then
-  printf '      ✅  Fatto   (con qualche avviso)\n\n'
+if [ "$MISSING_OTHER" -gt 0 ] || [ "$UNREACHABLE" -gt 0 ]; then
+  printf '      ✅  Fatto   (con qualche avviso, vedi sotto)\n\n'
 else
   printf '      ✅  Tutto sincronizzato!\n\n'
 fi
-printf '      %-28s %6s %6s\n' "Playlist" "YouTube" "Mac"
+printf '      %-30s %7s %5s\n' "Playlist" "YouTube" "Mac"
 printf '%s\n' "$UI_LINE"
 awk -F'\t' '{
-  name=$2; if (length(name)>26) name=substr(name,1,25) "…";
-  mark=($1=="OK")?"✓":(($1=="UNREACH")?"—":"⚠");
-  printf "      %-28s %6s %6s  %s\n", name, $3, $4, mark
+  name=$2; if (length(name)>28) name=substr(name,1,27) "~";
+  mark=($1=="OK")?"✓":(($1=="DEAD")?"✓*":(($1=="UNREACH")?"—":"⚠"));
+  printf "      %-30s %7s %5s  %s\n", name, $3, $4, mark
 }' "$RPT"
 printf '%s\n\n' "$UI_LINE"
-printf '      Brani nuovi scaricati:  %d\n' "$TOTAL_NEW"
-if [ "$TOTAL_DLERR" -gt 0 ]; then
-  printf '      Brani non scaricati:    %d  ⚠\n\n' "$TOTAL_DLERR"
-  printf '      I "non scaricati" di solito sono blocchi\n'
-  printf '      temporanei di YouTube: si risolvono da soli\n'
-  printf '      al prossimo avvio. Se restano, avvisa Stefano.\n'
-else
-  printf '\n      Nessun brano mancante. 👍\n'
+printf '      Brani nuovi scaricati:            %d\n' "$TOTAL_NEW"
+[ "$TOTAL_CLONED" -gt 0 ] && printf '      Brani aggiunti da altre playlist: %d\n' "$TOTAL_CLONED"
+if grep -q '^DEAD' "$RPT"; then
+  printf '\n      ✓* = completa: mancano solo brani spariti da YouTube\n'
+fi
+if [ "$MISSING_DEAD" -gt 0 ]; then
+  printf '\n      *  Brani che non esistono piu'\'' su YouTube:  %d\n' "$MISSING_DEAD"
+  printf '         Normale, non si possono recuperare.\n'
+fi
+if [ "$MISSING_OTHER" -gt 0 ]; then
+  printf '\n      ⚠  Brani non scaricati per ora:  %d\n' "$MISSING_OTHER"
+  printf '         Riprovo da solo al prossimo avvio. Se restano\n'
+  printf '         per qualche giorno, avvisa Stefano.\n'
 fi
 if [ "$UNREACHABLE" -gt 0 ]; then
-  printf '\n      ⚠  %d playlist non raggiungibili (— in tabella).\n' "$UNREACHABLE"
+  printf '\n      —  Playlist non trovate su YouTube:  %d\n' "$UNREACHABLE"
+  printf '         (cancellate o private). Avvisa Stefano.\n'
 fi
 printf '\n\n      Puoi chiudere questa finestra.  👋\n\n'
 
-# notifica di sistema
 if [ "$VALID_PLAYLISTS" -eq 0 ]; then
   osascript -e 'display notification "Nessuna musica aggiornata. Se non e giusto, chiama Stefano." with title "YouTubeSync"' 2>/dev/null
 else
   msg="Fatto! Musica aggiornata."
-  [ "$ANY_NEW" = true ] && msg="$msg $TOTAL_NEW brani nuovi."
+  [ "$TOTAL_NEW" -gt 0 ] && msg="$msg $TOTAL_NEW brani nuovi."
   osascript -e "display notification \"$msg\" with title \"YouTubeSync\" sound name \"Glass\"" 2>/dev/null
 fi
 
-rm -f "$RUN_LOG" "$RPT"
+rm -rf "$WORK"
