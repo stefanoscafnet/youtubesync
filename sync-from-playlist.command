@@ -1,7 +1,18 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v16 — ScafNet
-# NOVITA' rispetto alla v15:
+# YouTubeSync v17 — ScafNet
+# NOVITA' rispetto alla v16:
+#  - Max gestisce da solo le playlist: lo script installa e tiene
+#    aggiornato "Gestisci playlist.command" (aggiungi / togli / vedi)
+#    accanto a se stesso. Le modifiche passano dal foglio di Stefano.
+#  - Playlist non raggiungibili mostrate col loro NOME (dal foglio o
+#    dall'ultimo nome visto), non piu' "playlist n.X".
+#  - Controllo connessione all'avvio: senza internet messaggio chiaro,
+#    nessun file toccato, e il giro mancato viene segnalato nel log
+#    del sync successivo. Se YouTube non risponde a nessuna playlist,
+#    messaggio dedicato invece dell'elenco di "non trovate".
+#  - I nomi reali delle playlist vengono scritti nel foglio (colonna B).
+# Dalla v16:
 #  - Log pulito: dell'aggiornamento Homebrew resta solo la riga
 #    "yt-dlp vecchia -> nuova"; il dettaglio inviato al foglio e'
 #    tagliato sotto il limite di 50.000 caratteri della cella.
@@ -25,7 +36,7 @@
 #  - Resta: AUTO-AGGIORNANTE da GitHub, log completo a Stefano.
 # ============================================================
 
-APP_VERSION="v16"
+APP_VERSION="v17"
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -50,6 +61,20 @@ if [ -z "$YTS_SELFUPDATE_DONE" ] && printf '%s' "$GHRAW" | grep -q "^https"; the
   rm -f "$NEW"
 fi
 
+# --- INSTALLA / AGGIORNA "Gestisci playlist" accanto allo script (silenzioso) ---
+MGR_RAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/gestisci-playlist.command"
+MGR_PATH="$SELF_DIR/Gestisci playlist.command"
+MGR_STATUS=""
+MGR_NEW="$(mktemp)"
+if curl -fsSL "$MGR_RAW" -o "$MGR_NEW" 2>/dev/null && [ -s "$MGR_NEW" ] \
+   && grep -q "YouTubeSync Gestisci playlist" "$MGR_NEW" && bash -n "$MGR_NEW" 2>/dev/null; then
+  if ! cmp -s "$MGR_NEW" "$MGR_PATH"; then
+    [ -e "$MGR_PATH" ] && MGR_STATUS="aggiornato" || MGR_STATUS="installato"
+    cp "$MGR_NEW" "$MGR_PATH" && chmod +x "$MGR_PATH"
+  fi
+fi
+rm -f "$MGR_NEW"
+
 # --- CONFIG LOCALE (ENDPOINT_URL) ---
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 : "${ENDPOINT_URL:=}"
@@ -61,6 +86,8 @@ PLAYLIST_CACHE="$DEST_FOLDER/playlist_cache.txt"
 PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
 REMOVED_FOLDER="$DEST_FOLDER/_RIMOSSI"
 YTDLP_STAMP="$DEST_FOLDER/.ytdlp_update_stamp"
+NAMES_CACHE="$DEST_FOLDER/.playlist_names.tsv"   # id <TAB> ultimo nome visto
+OFFLINE_FILE="$DEST_FOLDER/.giri_senza_internet.txt"
 LOG_KEEP_LINES=5000
 DETAIL_MAX=45000                 # byte max del dettaglio inviato al foglio (cella: 50.000 caratteri)
 RETRY_CLIENTS=(tv web_safari)    # modalita' yt-dlp per il secondo tentativo sui bloccati
@@ -159,6 +186,30 @@ if [ -n "$missing" ]; then
 fi
 command -v deno >/dev/null 2>&1 || log "AVVISO deno non trovato — alcuni video potrebbero fallire (JS challenge)"
 
+[ -n "$MGR_STATUS" ] && log "\"Gestisci playlist\" $MGR_STATUS"
+
+# --- CONNESSIONE A INTERNET ---
+net_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' https://www.youtube.com 2>/dev/null)
+if [ -z "$net_code" ] || [ "$net_code" = "000" ]; then
+  draw_header
+  printf '      ⚠  Nessuna connessione a internet.\n\n'
+  printf '      Controlla il Wi-Fi e riprova.\n'
+  printf '      Non ho toccato nessun file.\n\n\n'
+  printf '      Puoi chiudere questa finestra.\n\n'
+  osascript -e 'display notification "Nessuna connessione a internet. Riprova piu tardi." with title "YouTubeSync"' 2>/dev/null
+  log "NESSUNA CONNESSIONE: sync non eseguito"
+  echo "$(date '+%Y-%m-%d %H:%M') tentativo di sync senza internet" >> "$OFFLINE_FILE"
+  rm -rf "$WORK"; exit 0
+fi
+OFFLINE_NOTE=""
+if [ -s "$OFFLINE_FILE" ]; then
+  n_off=$(wc -l < "$OFFLINE_FILE" | tr -d ' ')
+  log "nota: dal giro precedente $n_off tentativi senza internet:"
+  sed 's/^/     /' "$OFFLINE_FILE" >> "$RUN_LOG"
+  OFFLINE_NOTE=", giri_senza_internet_prima:$n_off"
+  rm -f "$OFFLINE_FILE"
+fi
+
 # --- AGGIORNAMENTO yt-dlp (max 1 volta al giorno) ---
 if command -v brew >/dev/null 2>&1; then
   if [ ! -f "$YTDLP_STAMP" ] || [ -n "$(find "$YTDLP_STAMP" -mtime +0 2>/dev/null)" ]; then
@@ -182,7 +233,7 @@ log "yt-dlp versione: ${YTDLP_VER:-sconosciuta}"
 # --- LISTA PLAYLIST (web -> cache -> locale) ---
 PLAYLIST_FILE=""
 if printf '%s' "$ENDPOINT_URL" | grep -q "^https"; then
-  if curl -fsSL "$ENDPOINT_URL" -o "${PLAYLIST_CACHE}.new" 2>/dev/null && [ -s "${PLAYLIST_CACHE}.new" ]; then
+  if curl -fsSL "${ENDPOINT_URL}?action=list" -o "${PLAYLIST_CACHE}.new" 2>/dev/null && [ -s "${PLAYLIST_CACHE}.new" ]; then
     mv "${PLAYLIST_CACHE}.new" "$PLAYLIST_CACHE"; PLAYLIST_FILE="$PLAYLIST_CACHE"
     log "lista playlist aggiornata da internet"
   else
@@ -212,7 +263,13 @@ while IFS= read -r raw_line <&3; do
   idx=$((idx + 1))
   playlist_url="https://www.youtube.com/playlist?list=$listid"
 
-  draw_progress "$idx" "$TOTAL_PL" "playlist $idx" "lettura da YouTube..."
+  # nome noto: dal foglio (id<TAB>nome<TAB>link) o dall'ultimo visto
+  known_name=""
+  case "$raw_line" in *$'\t'*) known_name=$(printf '%s' "$raw_line" | cut -f2) ;; esac
+  [ -z "$known_name" ] && known_name=$(awk -F'\t' -v id="$listid" '$1==id { print $2; exit }' "$NAMES_CACHE" 2>/dev/null)
+  [ -z "$known_name" ] && known_name="playlist n.$idx"
+
+  draw_progress "$idx" "$TOTAL_PL" "$known_name" "lettura da YouTube..."
 
   # UNA sola lettura: titolo + id di tutti i brani
   META="$WORK/meta"; CUR="$WORK/cur"
@@ -222,13 +279,16 @@ while IFS= read -r raw_line <&3; do
   yt_count=$(wc -l < "$CUR" | tr -d ' ')
 
   if [ -z "$folder_name" ] || [ "$folder_name" = "NA" ]; then
-    log "playlist non raggiungibile: $playlist_url"
+    log "playlist non raggiungibile: «$known_name» $playlist_url"
     UNREACHABLE=$((UNREACHABLE + 1))
-    printf 'UNREACH\t%s\t-\t-\t0\n' "playlist n.$idx (non raggiungibile)" >> "$RPT"
+    printf 'UNREACH\t%s\t-\t-\t0\n' "$known_name" >> "$RPT"
     continue
   fi
 
   VALID_PLAYLISTS=$((VALID_PLAYLISTS + 1))
+  # ricorda il nome (cache locale) e mandalo al foglio
+  { awk -F'\t' -v id="$listid" '$1!=id' "$NAMES_CACHE" 2>/dev/null; printf '%s\t%s\n' "$listid" "$folder_name"; } > "$WORK/nc" && cat "$WORK/nc" > "$NAMES_CACHE"
+  printf '%s\t%s\n' "$listid" "$folder_name" >> "$WORK/names"
   F="$DEST_FOLDER/$folder_name"
   mkdir -p "$F"
   log "sync: $folder_name ($yt_count brani su YouTube)"
@@ -374,7 +434,7 @@ done 3< <(grep -vE '^\s*$|^\s*#' "$PLAYLIST_FILE")
 END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 OTHER=$((TOTAL_DLERR - DEAD - BOT - E403 - E429)); [ "$OTHER" -lt 0 ] && OTHER=0
-SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW (di cui al 2o tentativo:$TOTAL_RETRY_OK), copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
+SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW (di cui al 2o tentativo:$TOTAL_RETRY_OK), copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE${OFFLINE_NOTE} (${DMIN}m${DSEC}s)"
 { [ "$UNREACHABLE" -gt 0 ] || [ "$MISSING_OTHER" -gt 0 ]; } && SUMMARY="ATTENZIONE $SUMMARY"
 log "durata: ${DMIN}m ${DSEC}s"
 log "fine — $SUMMARY"
@@ -388,6 +448,7 @@ echo "----------------------------------------" >> "$LOG_FILE"
 tail -n "$LOG_KEEP_LINES" "$LOG_FILE" > "$WORK/logtrim" 2>/dev/null && cat "$WORK/logtrim" > "$LOG_FILE"
 
 # --- INVIO LOG COMPLETO A STEFANO (sotto il limite della cella) ---
+touch "$WORK/names"
 DETAIL="$WORK/detail"
 det_size=$(wc -c < "$RUN_LOG" | tr -d ' ')
 if [ "$det_size" -gt "$DETAIL_MAX" ]; then
@@ -402,12 +463,21 @@ fi
 if printf '%s' "$ENDPOINT_URL" | grep -q "^https"; then
   curl -fsS -X POST "$ENDPOINT_URL" \
     --data-urlencode "summary=$SUMMARY" \
-    --data-urlencode "detail@$DETAIL" >/dev/null 2>&1 \
+    --data-urlencode "detail@$DETAIL" \
+    --data-urlencode "names@$WORK/names" >/dev/null 2>&1 \
     && log "stato inviato a Stefano" || log "AVVISO invio stato non riuscito"
 fi
 
 # ---------- SCHERMATA FINALE PER MAX ----------
 draw_header
+if [ "$VALID_PLAYLISTS" -eq 0 ] && [ "$UNREACHABLE" -gt 0 ]; then
+  printf '      ⚠  YouTube non risponde in questo momento.\n\n'
+  printf '      Non ho toccato nessun file.\n'
+  printf '      Riprova tra un po'\''. Se succede di nuovo, avvisa Stefano.\n\n\n'
+  printf '      Puoi chiudere questa finestra.\n\n'
+  osascript -e 'display notification "YouTube non risponde. Riprova tra un po." with title "YouTubeSync"' 2>/dev/null
+  rm -rf "$WORK"; exit 0
+fi
 if [ "$MISSING_OTHER" -gt 0 ] || [ "$UNREACHABLE" -gt 0 ]; then
   printf '      ✅  Fatto   (con qualche avviso, vedi sotto)\n\n'
 else
@@ -437,7 +507,15 @@ if [ "$MISSING_OTHER" -gt 0 ]; then
 fi
 if [ "$UNREACHABLE" -gt 0 ]; then
   printf '\n      —  Playlist non trovate su YouTube:  %d\n' "$UNREACHABLE"
-  printf '         (cancellate o private). Avvisa Stefano.\n'
+  printf '         Sono state cancellate o rese private.\n'
+  printf '         Se non ti servono piu'\'', toglile con\n'
+  printf '         "Gestisci playlist"; se ti servono, su YouTube\n'
+  printf '         mettile "Non in elenco".\n'
+fi
+if [ "$MGR_STATUS" = "installato" ]; then
+  printf '\n      🆕  Novita'\'': nella cartella YoutubeSync trovi\n'
+  printf '         "Gestisci playlist" per aggiungere o togliere\n'
+  printf '         le playlist da solo.\n'
 fi
 printf '\n\n      Puoi chiudere questa finestra.  👋\n\n'
 
