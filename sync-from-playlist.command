@@ -1,7 +1,15 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v15 — ScafNet
-# NOVITA' rispetto alla v14:
+# YouTubeSync v16 — ScafNet
+# NOVITA' rispetto alla v15:
+#  - Log pulito: dell'aggiornamento Homebrew resta solo la riga
+#    "yt-dlp vecchia -> nuova"; il dettaglio inviato al foglio e'
+#    tagliato sotto il limite di 50.000 caratteri della cella.
+#  - Per ogni brano mancante il log riporta link, titolo e motivo
+#    (morto / bloccato), cosi' Stefano puo' aprirlo e verificarlo.
+#  - Secondo tentativo automatico per i brani bloccati (403 ecc.)
+#    con altre modalita' di yt-dlp (RETRY_CLIENTS).
+# Dalla v15:
 #  - CARTELLE COMPLETE: ogni cartella playlist contiene TUTTI i suoi
 #    brani. Un brano presente in piu' playlist si scarica una volta
 #    sola e nelle altre cartelle viene messo come "clone" APFS
@@ -17,7 +25,7 @@
 #  - Resta: AUTO-AGGIORNANTE da GitHub, log completo a Stefano.
 # ============================================================
 
-APP_VERSION="v15"
+APP_VERSION="v16"
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -54,6 +62,8 @@ PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
 REMOVED_FOLDER="$DEST_FOLDER/_RIMOSSI"
 YTDLP_STAMP="$DEST_FOLDER/.ytdlp_update_stamp"
 LOG_KEEP_LINES=5000
+DETAIL_MAX=45000                 # byte max del dettaglio inviato al foglio (cella: 50.000 caratteri)
+RETRY_CLIENTS=(tv web_safari)    # modalita' yt-dlp per il secondo tentativo sui bloccati
 
 YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3)
 YT_META_OPTS=(--retries 5 --extractor-retries 3)
@@ -61,7 +71,7 @@ YT_META_OPTS=(--retries 5 --extractor-retries 3)
 # --- STATO ---
 VALID_PLAYLISTS=0; SKIPPED_LINES=0; UNREACHABLE=0
 TOTAL_NEW=0; TOTAL_CLONED=0; TOTAL_RESTORED=0; TOTAL_REMOVED=0; TOTAL_DUPDEL=0
-TOTAL_DLERR=0; DEAD=0; BOT=0; E403=0; E429=0
+TOTAL_RETRY_OK=0; TOTAL_DLERR=0; DEAD=0; BOT=0; E403=0; E429=0
 MISSING_DEAD=0; MISSING_OTHER=0
 START_TIME=$(date +%s)
 
@@ -154,7 +164,15 @@ if command -v brew >/dev/null 2>&1; then
   if [ ! -f "$YTDLP_STAMP" ] || [ -n "$(find "$YTDLP_STAMP" -mtime +0 2>/dev/null)" ]; then
     draw_simple "Controllo aggiornamenti..."
     log "aggiornamento yt-dlp (brew)"
-    HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade yt-dlp </dev/null >>"$RUN_LOG" 2>&1
+    HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade yt-dlp </dev/null >"$WORK/brew.out" 2>&1
+    brew_rc=$?
+    up=$(grep -E '^yt-dlp [^ ]+ -> ' "$WORK/brew.out" | head -n1)
+    already=$(grep -iE 'yt-dlp.*already installed' "$WORK/brew.out" | head -n1)
+    if [ -n "$up" ]; then log "   brew: $up"
+    elif [ -n "$already" ]; then log "   brew: yt-dlp gia' all'ultima versione"
+    else log "   brew: esito $brew_rc (nessun aggiornamento di yt-dlp)"
+      grep -iE '^Error' "$WORK/brew.out" | head -n 3 | sed 's/^/     /' >> "$RUN_LOG"
+    fi
     touch "$YTDLP_STAMP"
   fi
 fi
@@ -198,7 +216,7 @@ while IFS= read -r raw_line <&3; do
 
   # UNA sola lettura: titolo + id di tutti i brani
   META="$WORK/meta"; CUR="$WORK/cur"
-  yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print $'%(playlist_title)s\t%(id)s' "$playlist_url" </dev/null 2>/dev/null > "$META"
+  yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print $'%(playlist_title)s\t%(id)s\t%(title)s' "$playlist_url" </dev/null 2>/dev/null > "$META"
   folder_name=$(head -n1 "$META" | cut -f1)
   cut -f2 "$META" | grep -E '^[A-Za-z0-9_-]{11}$' | sort -u > "$CUR"
   yt_count=$(wc -l < "$CUR" | tr -d ' ')
@@ -282,6 +300,32 @@ while IFS= read -r raw_line <&3; do
       log "   $dlerr non scaricabili in \"$folder_name\" (morti:$d_dead signin:$d_bot 403:$d_403 429:$d_429)"
       grep '^ERROR:' "$ERRLOG" | head -n 40 | sed 's/^/     /' >> "$RUN_LOG"
     fi
+
+    # secondo tentativo: solo i mancanti NON morti, con altre modalita' di yt-dlp
+    ids_in_folder "$F" > "$HAVE"
+    comm -23 "$CUR" "$HAVE" | comm -23 - "$DEADIDS" > "$WORK/retry"
+    for client in "${RETRY_CLIENTS[@]}"; do
+      n_retry=$(wc -l < "$WORK/retry" | tr -d ' ')
+      [ "$n_retry" -eq 0 ] && break
+      draw_progress "$idx" "$TOTAL_PL" "$folder_name" "secondo tentativo per $n_retry brani..."
+      sed 's#^#https://www.youtube.com/watch?v=#' "$WORK/retry" > "$URLS"
+      b2=$(ids_in_folder "$F" | wc -l | tr -d ' ')
+      ( cd "$F" && yt-dlp \
+          --quiet --no-warnings --ignore-errors --no-overwrites \
+          "${YT_NET_OPTS[@]}" \
+          --extractor-args "youtube:player_client=$client" \
+          --extract-audio --audio-format mp3 --audio-quality 0 \
+          --embed-thumbnail --add-metadata \
+          --output "%(title)s [%(id)s].%(ext)s" \
+          -a "$URLS" </dev/null >>"$RUN_LOG" 2>"$WORK/err2" )
+      a2=$(ids_in_folder "$F" | wc -l | tr -d ' ')
+      got=$((a2 - b2)); [ "$got" -lt 0 ] && got=0
+      TOTAL_RETRY_OK=$((TOTAL_RETRY_OK + got)); TOTAL_NEW=$((TOTAL_NEW + got))
+      log "   secondo tentativo ($client) in \"$folder_name\": recuperati $got su $n_retry"
+      grep '^ERROR:' "$WORK/err2" | head -n 5 | sed "s/^/     [$client] /" >> "$RUN_LOG"
+      ids_in_folder "$F" > "$HAVE"
+      comm -23 "$CUR" "$HAVE" | comm -23 - "$DEADIDS" > "$WORK/retry"
+    done
   fi
 
   # FASE 3 — brani tolti dalla playlist
@@ -310,6 +354,12 @@ while IFS= read -r raw_line <&3; do
   miss_n=$(wc -l < "$MISS" | tr -d ' ')
   miss_dead=$(comm -12 "$MISS" "$DEADIDS" | wc -l | tr -d ' ')
   MISSING_DEAD=$((MISSING_DEAD + miss_dead))
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    t=$(awk -F'\t' -v id="$id" '$2==id { print $3; exit }' "$META")
+    if grep -qxF -- "$id" "$DEADIDS"; then why="non esiste piu'"; else why="bloccato"; fi
+    log "   manca in \"$folder_name\": https://youtu.be/$id  ($why)  $t"
+  done < "$MISS"
   MISSING_OTHER=$((MISSING_OTHER + miss_n - miss_dead))
   if [ "$miss_n" -eq 0 ]; then st="OK"
   elif [ "$miss_n" -eq "$miss_dead" ]; then st="DEAD"
@@ -324,7 +374,7 @@ done 3< <(grep -vE '^\s*$|^\s*#' "$PLAYLIST_FILE")
 END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 OTHER=$((TOTAL_DLERR - DEAD - BOT - E403 - E429)); [ "$OTHER" -lt 0 ] && OTHER=0
-SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW, copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
+SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW (di cui al 2o tentativo:$TOTAL_RETRY_OK), copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
 { [ "$UNREACHABLE" -gt 0 ] || [ "$MISSING_OTHER" -gt 0 ]; } && SUMMARY="ATTENZIONE $SUMMARY"
 log "durata: ${DMIN}m ${DSEC}s"
 log "fine — $SUMMARY"
@@ -337,11 +387,22 @@ echo "----------------------------------------" >> "$LOG_FILE"
 # il log locale non cresce all'infinito
 tail -n "$LOG_KEEP_LINES" "$LOG_FILE" > "$WORK/logtrim" 2>/dev/null && cat "$WORK/logtrim" > "$LOG_FILE"
 
-# --- INVIO LOG COMPLETO A STEFANO ---
+# --- INVIO LOG COMPLETO A STEFANO (sotto il limite della cella) ---
+DETAIL="$WORK/detail"
+det_size=$(wc -c < "$RUN_LOG" | tr -d ' ')
+if [ "$det_size" -gt "$DETAIL_MAX" ]; then
+  {
+    head -c $((DETAIL_MAX / 3)) "$RUN_LOG"
+    printf '\n\n... [log tagliato: %s byte in tutto, qui sotto la parte finale; completo sul Mac in youtube_sync.log] ...\n\n' "$det_size"
+    tail -c $((DETAIL_MAX * 2 / 3 - 300)) "$RUN_LOG"
+  } > "$DETAIL"
+else
+  cp "$RUN_LOG" "$DETAIL"
+fi
 if printf '%s' "$ENDPOINT_URL" | grep -q "^https"; then
   curl -fsS -X POST "$ENDPOINT_URL" \
     --data-urlencode "summary=$SUMMARY" \
-    --data-urlencode "detail@$RUN_LOG" >/dev/null 2>&1 \
+    --data-urlencode "detail@$DETAIL" >/dev/null 2>&1 \
     && log "stato inviato a Stefano" || log "AVVISO invio stato non riuscito"
 fi
 
