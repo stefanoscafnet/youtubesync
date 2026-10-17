@@ -1,6 +1,9 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v11 — ScafNet
+# YouTubeSync v12 — ScafNet
+# FIX: aggiunto "--" ai grep che usano un video ID come pattern.
+#      Gli ID che iniziano con "-" venivano scambiati per opzioni di grep
+#      (errori "invalid option"), falsando rimozioni e ripristini.
 # NOVITA' rispetto alla v10 (fix della causa vera dei rallentamenti
 # e dei "video falliti"):
 #  1) RIALLINEAMENTO ARCHIVIO: all'avvio lo script legge gli ID dai
@@ -79,7 +82,7 @@ extract_id_from_filename() {
 }
 
 osascript -e 'display notification "Sincronizzazione in corso..." with title "YouTubeSync" sound name "Submarine"'
-log "inizio sincronizzazione (v11)"
+log "inizio sincronizzazione (v12)"
 
 # --- CHECK DIPENDENZE ---
 if ! command -v yt-dlp >/dev/null 2>&1; then
@@ -105,7 +108,7 @@ awk '/^youtube /{print $2}' "$ARCHIVE_FILE" | sort -u > "$ARCH_IDS"
 added=0
 while IFS= read -r id; do
   [ -z "$id" ] && continue
-  if ! grep -qx "$id" "$ARCH_IDS"; then
+  if ! grep -qx -- "$id" "$ARCH_IDS"; then
     echo "youtube $id" >> "$ARCHIVE_FILE"
     added=$((added + 1))
   fi
@@ -168,7 +171,7 @@ while IFS= read -r raw_line; do
         [ ! -e "$file" ] && continue
         base=$(basename "$file")
         fid=$(extract_id_from_filename "$base"); [ -z "$fid" ] && continue
-        if grep -Fxq "$fid" "$CUR0" && [ ! -e "$playlist_folder/$base" ]; then
+        if grep -Fxq -- "$fid" "$CUR0" && [ ! -e "$playlist_folder/$base" ]; then
           mv "$file" "$playlist_folder/"
           echo "youtube $fid" >> "$ARCHIVE_FILE"
           log "   ripristinato da _RIMOSSI: $base -> $folder_name"
@@ -214,11 +217,11 @@ while IFS= read -r raw_line; do
       [ ! -e "$file" ] && continue
       fid=$(extract_id_from_filename "$file")
       if [ -z "$fid" ]; then log "   senza ID, ignorato dalla rimozione: $file"; continue; fi
-      if ! grep -Fxq "$fid" "$CUR"; then
+      if ! grep -Fxq -- "$fid" "$CUR"; then
         mkdir -p "$REMOVED_FOLDER"
         mv -f "$file" "$REMOVED_FOLDER/"
         if [ -f "$ARCHIVE_FILE" ]; then
-          grep -v "youtube $fid" "$ARCHIVE_FILE" > "${ARCHIVE_FILE}.tmp" 2>/dev/null && mv "${ARCHIVE_FILE}.tmp" "$ARCHIVE_FILE"
+          grep -vxF -- "youtube $fid" "$ARCHIVE_FILE" > "${ARCHIVE_FILE}.tmp" 2>/dev/null && mv "${ARCHIVE_FILE}.tmp" "$ARCHIVE_FILE"
         fi
         log "   rimosso da \"$folder_name\" -> _RIMOSSI: $file"
         removed_here=$((removed_here + 1)); TOTAL_REMOVED=$((TOTAL_REMOVED + 1)); ANY_REMOVED=true
