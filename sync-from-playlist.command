@@ -1,22 +1,18 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v12 — ScafNet
-# FIX: aggiunto "--" ai grep che usano un video ID come pattern.
-#      Gli ID che iniziano con "-" venivano scambiati per opzioni di grep
-#      (errori "invalid option"), falsando rimozioni e ripristini.
-# NOVITA' rispetto alla v10 (fix della causa vera dei rallentamenti
-# e dei "video falliti"):
-#  1) RIALLINEAMENTO ARCHIVIO: all'avvio lo script legge gli ID dai
-#     nomi dei file MP3 gia' presenti ([xxxxxxxxxxx].mp3) e li scrive
-#     nell'archivio. Cosi' yt-dlp salta per ID (prima di toccare la
-#     rete) tutto cio' che e' gia' scaricato, anche se il TITOLO del
-#     video e' cambiato. Il sync diventa di secondi e sparisce il
-#     throttling che generava i "video falliti".
-#  2) RIMOSSO --sleep-requests: non serve piu' (pochissime richieste).
-#     Tenuti i retry e il conteggio video_falliti.
+# YouTubeSync v13 — ScafNet
+# NOVITA' rispetto alla v12: DIAGNOSI DEI FALLITI.
+#  Per ogni video non scaricabile lo script classifica l'errore:
+#   - morti   = Video non disponibile / privato / rimosso / copyright
+#   - signin  = "Sign in to confirm you're not a bot" (anti-bot)
+#   - 403/429 = throttling / rate limit di YouTube
+#   - altro   = tutto il resto
+#  Il dettaglio compare per playlist e nel riepilogo finale, cosi'
+#  si capisce da remoto se i falliti sono video morti (irrecuperabili)
+#  o throttling (da calibrare).
 #
-# Resto come v10: AUTO-AGGIORNANTE da GitHub, lista da web app GAS
-# (con cache), _RIMOSSI unica, config locale (config.sh), ecc.
+# Resto come v12: AUTO-AGGIORNANTE da GitHub, riallineamento archivio,
+# fix grep "--" per ID con trattino, _RIMOSSI unica, config locale, ecc.
 # ============================================================
 
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
@@ -55,7 +51,6 @@ PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
 REMOVED_DIRNAME="_RIMOSSI"
 REMOVED_FOLDER="$DEST_FOLDER/$REMOVED_DIRNAME"
 
-# Opzioni yt-dlp (retry per robustezza; niente sleep: ora si scarica poco)
 YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3)
 YT_META_OPTS=(--retries 5 --extractor-retries 3)
 
@@ -63,6 +58,7 @@ YT_META_OPTS=(--retries 5 --extractor-retries 3)
 ANY_NEW=false; ANY_REMOVED=false; ANY_RESTORED=false
 VALID_PLAYLISTS=0; SKIPPED_LINES=0; UNREACHABLE=0
 TOTAL_REMOVED=0; TOTAL_RESTORED=0; TOTAL_DLERR=0
+DEAD=0; BOT=0; E403=0; E429=0
 START_TIME=$(date +%s)
 
 mkdir -p "$DEST_FOLDER"
@@ -82,7 +78,7 @@ extract_id_from_filename() {
 }
 
 osascript -e 'display notification "Sincronizzazione in corso..." with title "YouTubeSync" sound name "Submarine"'
-log "inizio sincronizzazione (v12)"
+log "inizio sincronizzazione (v13)"
 
 # --- CHECK DIPENDENZE ---
 if ! command -v yt-dlp >/dev/null 2>&1; then
@@ -98,8 +94,6 @@ if ! command -v deno >/dev/null 2>&1; then
 fi
 
 # --- RIALLINEAMENTO ARCHIVIO DAI FILE GIA' PRESENTI ---
-# Per ogni MP3 con ID nel nome (escluse le _RIMOSSI) assicura che
-# "youtube <id>" sia nell'archivio, cosi' yt-dlp lo salta per ID.
 touch "$ARCHIVE_FILE"
 EXIST_IDS=$(mktemp); ARCH_IDS=$(mktemp)
 find "$DEST_FOLDER" -type f -name "*].mp3" ! -path "$REMOVED_FOLDER/*" 2>/dev/null \
@@ -182,7 +176,7 @@ while IFS= read -r raw_line; do
     rm -f "$CUR0"
   fi
 
-  # FASE 1 — DOWNLOAD nuovi (errori yt-dlp catturati e contati)
+  # FASE 1 — DOWNLOAD nuovi (errori catturati e CLASSIFICATI)
   cd "$playlist_folder" || continue
   before=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
   ERRLOG=$(mktemp)
@@ -195,11 +189,16 @@ while IFS= read -r raw_line; do
     --output "%(title)s [%(id)s].%(ext)s" \
     "$playlist_url" 2>"$ERRLOG"
   dlerr=$(grep -c '^ERROR:' "$ERRLOG" 2>/dev/null)
-  rm -f "$ERRLOG"
   if [ "${dlerr:-0}" -gt 0 ]; then
-    log "   $dlerr video non scaricabili in \"$folder_name\" (rimossi/privati o throttling)"
+    d_dead=$(grep -ciE '^ERROR:.*(unavailable|private|removed|terminated|copyright|not available|no longer)' "$ERRLOG")
+    d_bot=$(grep -ciE '^ERROR:.*(sign in to confirm|not a bot|confirm you)' "$ERRLOG")
+    d_403=$(grep -ciE '^ERROR:.*(403|forbidden)' "$ERRLOG")
+    d_429=$(grep -ciE '^ERROR:.*(429|too many requests)' "$ERRLOG")
+    DEAD=$((DEAD + d_dead)); BOT=$((BOT + d_bot)); E403=$((E403 + d_403)); E429=$((E429 + d_429))
     TOTAL_DLERR=$((TOTAL_DLERR + dlerr))
+    log "   $dlerr non scaricabili in \"$folder_name\" (morti:$d_dead signin:$d_bot 403:$d_403 429:$d_429)"
   fi
+  rm -f "$ERRLOG"
   after=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
   new=$((after - before))
   if [ "$new" -gt 0 ]; then ANY_NEW=true; log "nuovi in \"$folder_name\": $new"; fi
@@ -238,7 +237,8 @@ END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 log "durata: ${DMIN}m ${DSEC}s"
 
-SUMMARY="Sync OK — playlist:$VALID_PLAYLISTS, nuovi:$ANY_NEW, rimossi:$TOTAL_REMOVED, ripristinati:$TOTAL_RESTORED, video_falliti:$TOTAL_DLERR, righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
+OTHER=$((TOTAL_DLERR - DEAD - BOT - E403 - E429)); [ "$OTHER" -lt 0 ] && OTHER=0
+SUMMARY="Sync OK — playlist:$VALID_PLAYLISTS, nuovi:$ANY_NEW, rimossi:$TOTAL_REMOVED, ripristinati:$TOTAL_RESTORED, video_falliti:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
 [ "$UNREACHABLE" -gt 0 ] && SUMMARY="ATTENZIONE $SUMMARY"
 log "fine — $SUMMARY"
 echo "----------------------------------------" >> "$LOG_FILE"
