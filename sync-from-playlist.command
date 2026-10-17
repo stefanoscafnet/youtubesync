@@ -1,7 +1,13 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v18 — ScafNet
-# NOVITA' rispetto alla v17:
+# YouTubeSync v19 — ScafNet
+# NOVITA' rispetto alla v18:
+#  - I brani non disponibili sono divisi in due gruppi:
+#    * CANCELLATI O PRIVATI (YouTube non ne conosce piu' il titolo):
+#      non tornano, link al video per riconoscerlo;
+#    * BLOCCATI (il titolo c'e' ancora, spesso bloccati in Italia):
+#      link di RICERCA su YouTube per trovare un'altra versione.
+# Dalla v18:
 #  - Nella schermata finale, elenco dei brani che non esistono piu' su
 #    YouTube, divisi per playlist, con il link da aprire (Cmd + doppio clic).
 #  - Corretto il nome delle playlist non raggiungibili nel log (« »).
@@ -40,7 +46,7 @@
 #  - Resta: AUTO-AGGIORNANTE da GitHub, log completo a Stefano.
 # ============================================================
 
-APP_VERSION="v18"
+APP_VERSION="v19"
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -103,7 +109,7 @@ YT_META_OPTS=(--retries 5 --extractor-retries 3)
 VALID_PLAYLISTS=0; SKIPPED_LINES=0; UNREACHABLE=0
 TOTAL_NEW=0; TOTAL_CLONED=0; TOTAL_RESTORED=0; TOTAL_REMOVED=0; TOTAL_DUPDEL=0
 TOTAL_RETRY_OK=0; TOTAL_DLERR=0; DEAD=0; BOT=0; E403=0; E429=0
-MISSING_DEAD=0; MISSING_OTHER=0
+MISSING_DEAD=0; MISSING_OTHER=0; MISSING_GONE=0; MISSING_BLOCKED=0
 START_TIME=$(date +%s)
 
 mkdir -p "$DEST_FOLDER"
@@ -144,6 +150,33 @@ find_src() {
 other_copy() {
   awk -F'\t' -v id="$1" -v F="$2/" -v R="$REMOVED_FOLDER/" '
     $1==id && index($2,F)!=1 && index($2,R)!=1 { print $2; exit }' "$INDEX"
+}
+
+# titolo che YouTube da' ai video cancellati/privati
+is_gone_title() {
+  case "$1" in
+    ""|NA|"[Deleted video]"|"[Private video]"|"[Video eliminato]"|"[Video privato]") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# link di ricerca YouTube corto (resta su una riga del Terminale)
+search_url() {
+  local LC_ALL=C s="$1" o="" c i
+  s=$(printf '%s' "$s" | sed 's/[][()]/ /g' | tr -s ' ' | sed 's/^ //; s/ $//')
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9.~_-]) o="$o$c" ;;
+      ' ') o="$o+" ;;
+      *) o="$o$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  if [ ${#o} -gt 32 ]; then
+    o="${o:0:32}"
+    case "$o" in *+*) o="${o%+*}" ;; esac
+    o=$(printf '%s' "$o" | sed -E 's/%[0-9A-F]?$//')
+  fi
+  printf 'https://youtube.com/results?search_query=%s' "$o"
 }
 
 # ---------- INTERFACCIA ----------
@@ -422,9 +455,13 @@ while IFS= read -r raw_line <&3; do
     [ -z "$id" ] && continue
     t=$(awk -F'\t' -v id="$id" '$2==id { print $3; exit }' "$META")
     if grep -qxF -- "$id" "$DEADIDS"; then
-      why="non esiste piu'"
-      printf '%s\t%s\t%s\n' "$folder_name" "$t" "$id" >> "$WORK/deadlist"
-    else why="bloccato"; fi
+      if is_gone_title "$t"; then
+        why="cancellato o privato"; kind=G; MISSING_GONE=$((MISSING_GONE + 1)); surl=""
+      else
+        why="bloccato (spesso solo in Italia)"; kind=B; MISSING_BLOCKED=$((MISSING_BLOCKED + 1)); surl=$(search_url "$t")
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$folder_name" "$t" "$id" "$kind" "$surl" >> "$WORK/deadlist"
+    else why="non scaricato per ora"; fi
     log "   manca in \"$folder_name\": https://youtu.be/$id  ($why)  $t"
   done < "$MISS"
   MISSING_OTHER=$((MISSING_OTHER + miss_n - miss_dead))
@@ -441,7 +478,7 @@ done 3< <(grep -vE '^\s*$|^\s*#' "$PLAYLIST_FILE")
 END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 OTHER=$((TOTAL_DLERR - DEAD - BOT - E403 - E429)); [ "$OTHER" -lt 0 ] && OTHER=0
-SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW (di cui al 2o tentativo:$TOTAL_RETRY_OK), copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE${OFFLINE_NOTE} (${DMIN}m${DSEC}s)"
+SUMMARY="Sync $APP_VERSION (yt-dlp ${YTDLP_VER:-?}) — playlist:$VALID_PLAYLISTS, nuovi:$TOTAL_NEW (di cui al 2o tentativo:$TOTAL_RETRY_OK), copiati_da_altre:$TOTAL_CLONED, ripristinati:$TOTAL_RESTORED, rimossi:$TOTAL_REMOVED, doppioni_tolti:$TOTAL_DUPDEL, mancanti:$((MISSING_DEAD + MISSING_OTHER)) [morti:$MISSING_DEAD (cancellati:$MISSING_GONE bloccati:$MISSING_BLOCKED) altri:$MISSING_OTHER], errori_download:$TOTAL_DLERR [morti:$DEAD signin:$BOT 403:$E403 429:$E429 altro:$OTHER], righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE${OFFLINE_NOTE} (${DMIN}m${DSEC}s)"
 { [ "$UNREACHABLE" -gt 0 ] || [ "$MISSING_OTHER" -gt 0 ]; } && SUMMARY="ATTENZIONE $SUMMARY"
 log "durata: ${DMIN}m ${DSEC}s"
 log "fine — $SUMMARY"
@@ -501,18 +538,29 @@ printf '%s\n\n' "$UI_LINE"
 printf '      Brani nuovi scaricati:            %d\n' "$TOTAL_NEW"
 [ "$TOTAL_CLONED" -gt 0 ] && printf '      Brani aggiunti da altre playlist: %d\n' "$TOTAL_CLONED"
 if grep -q '^DEAD' "$RPT"; then
-  printf '\n      ✓* = completa: mancano solo brani spariti da YouTube\n'
+  printf '\n      ✓* = completa: mancano solo brani non disponibili su YouTube\n'
 fi
-if [ "$MISSING_DEAD" -gt 0 ]; then
-  printf '\n      *  Brani che non esistono piu'\'' su YouTube:  %d\n' "$MISSING_DEAD"
-  printf '         Normale, non si possono recuperare.\n'
-  if [ -s "$WORK/deadlist" ]; then
-    printf '         Per aprire un link: tieni premuto ⌘ e fai doppio clic.\n'
-    awk -F'\t' '
-      $1 != last { printf "\n         %s\n", $1; last = $1 }
-      { t = $2; if (t == "" || t == "NA") t = "(titolo non piu'\'' disponibile)"
+if [ "$MISSING_DEAD" -gt 0 ] && [ -s "$WORK/deadlist" ]; then
+  printf '\n      *  Brani non disponibili su YouTube:  %d\n' "$MISSING_DEAD"
+  printf '         Per aprire un link: tieni premuto ⌘ e fai doppio clic.\n'
+  if [ "$MISSING_GONE" -gt 0 ]; then
+    printf '\n      CANCELLATI O PRIVATI:  %d\n' "$MISSING_GONE"
+    printf '      Non tornano piu'\''. Se vuoi, toglili dalla playlist.\n'
+    awk -F'\t' '$4 == "G" {
+        if ($1 != last) { printf "\n         %s\n", $1; last = $1 }
+        t = $2; if (t == "" || t == "NA") t = "(titolo non piu'\'' disponibile)"
         if (length(t) > 60) t = substr(t, 1, 59) "~"
         printf "           • %s\n             https://youtu.be/%s\n", t, $3 }' "$WORK/deadlist"
+  fi
+  if [ "$MISSING_BLOCKED" -gt 0 ]; then
+    printf '\n      BLOCCATI (spesso solo in Italia):  %d\n' "$MISSING_BLOCKED"
+    printf '      Cerca un'\''altra versione dello stesso brano e\n'
+    printf '      aggiungila alla playlist: apri il link di ricerca\n'
+    printf '      sotto il titolo.\n'
+    awk -F'\t' '$4 == "B" {
+        if ($1 != last) { printf "\n         %s\n", $1; last = $1 }
+        t = $2; if (length(t) > 60) t = substr(t, 1, 59) "~"
+        printf "           • %s\n      %s\n", t, $5 }' "$WORK/deadlist"
   fi
 fi
 if [ "$MISSING_OTHER" -gt 0 ]; then
