@@ -1,23 +1,20 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v9 — ScafNet
-# AUTO-AGGIORNANTE: a ogni avvio lo script controlla se su
-# GitHub c'e' una versione piu' recente e, se c'e', si
-# sostituisce da solo prima di partire. Cosi' Stefano aggiorna
-# il codice sul repo (push) e il Mac di Max lo prende da solo
-# al sync successivo, senza AnyDesk.
+# YouTubeSync v10 — ScafNet
+# NOVITA' rispetto alla v9:
+#  1) Meno errori da YouTube: aggiunti --retries, --fragment-retries,
+#     --extractor-retries e --sleep-requests (micro-pausa tra le
+#     richieste). Riduce i 403/429 e le playlist "non raggiungibili".
+#  2) Errori yt-dlp nel LOG del foglio: per ogni playlist viene
+#     contato quanti video non si sono potuti scaricare (rimossi/
+#     privati o throttling) e il totale finisce nel riepilogo.
+#     Cosi' Stefano li vede da remoto senza guardare il terminale.
 #
-# SEPARAZIONE CODICE/CONFIG:
-#  - Questo file (codice) sta su GitHub, pubblico, senza segreti.
-#  - L'ENDPOINT_URL (web app GAS) sta in config.sh LOCALE accanto
-#    a questo script, scritto dall'installer e MAI committato.
-#
-# Come la v8: lista playlist da web app GAS (con cache), log
-# inviato a Stefano, _RIMOSSI unica generale, auto-correzione
-# righe, nomi con ID, nessuna notifica allarmante per Max.
+# Resto come v9: AUTO-AGGIORNANTE da GitHub, lista playlist da web
+# app GAS (con cache), _RIMOSSI unica generale, nomi con ID,
+# config locale (ENDPOINT_URL in config.sh), notifiche tranquille.
 # ============================================================
 
-# URL "grezzo" del file su GitHub da cui auto-aggiornarsi.
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
 
 export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -26,11 +23,7 @@ SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 SELF_PATH="$SELF_DIR/$(basename "$0")"
 CONFIG_FILE="$SELF_DIR/config.sh"
 
-# --- AUTO-UPDATE DA GITHUB (prima di tutto) ---
-# Sicurezza: aggiorna solo se il file scaricato non e' vuoto, contiene
-# il marcatore "YouTubeSync v" ed e' sintatticamente valido. Se qualcosa
-# non torna, tiene la versione attuale e prosegue. Niente loop grazie a
-# YTS_SELFUPDATE_DONE.
+# --- AUTO-UPDATE DA GITHUB ---
 if [ -z "$YTS_SELFUPDATE_DONE" ] && printf '%s' "$GHRAW" | grep -q "^https"; then
   NEW="$(mktemp)"
   if curl -fsSL "$GHRAW" -o "$NEW" 2>/dev/null \
@@ -39,9 +32,7 @@ if [ -z "$YTS_SELFUPDATE_DONE" ] && printf '%s' "$GHRAW" | grep -q "^https"; the
      && bash -n "$NEW" 2>/dev/null; then
     if ! cmp -s "$NEW" "$SELF_PATH"; then
       cp "$NEW" "$SELF_PATH" && chmod +x "$SELF_PATH"
-      rm -f "$NEW"
-      export YTS_SELFUPDATE_DONE=1
-      exec "$SELF_PATH"
+      rm -f "$NEW"; export YTS_SELFUPDATE_DONE=1; exec "$SELF_PATH"
     fi
   fi
   rm -f "$NEW"
@@ -60,10 +51,14 @@ PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
 REMOVED_DIRNAME="_RIMOSSI"
 REMOVED_FOLDER="$DEST_FOLDER/$REMOVED_DIRNAME"
 
+# Opzioni yt-dlp per ridurre gli errori di rete/throttling
+YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3 --sleep-requests 1)
+YT_META_OPTS=(--retries 5 --extractor-retries 3)
+
 # --- STATO ---
 ANY_NEW=false; ANY_REMOVED=false; ANY_RESTORED=false
 VALID_PLAYLISTS=0; SKIPPED_LINES=0; UNREACHABLE=0
-TOTAL_REMOVED=0; TOTAL_RESTORED=0
+TOTAL_REMOVED=0; TOTAL_RESTORED=0; TOTAL_DLERR=0
 START_TIME=$(date +%s)
 
 mkdir -p "$DEST_FOLDER"
@@ -76,7 +71,7 @@ log() {
 }
 
 osascript -e 'display notification "Sincronizzazione in corso..." with title "YouTubeSync" sound name "Submarine"'
-log "inizio sincronizzazione (v9)"
+log "inizio sincronizzazione (v10)"
 
 # --- CHECK DIPENDENZE ---
 if ! command -v yt-dlp >/dev/null 2>&1; then
@@ -133,7 +128,7 @@ while IFS= read -r raw_line; do
   fi
 
   playlist_url="https://www.youtube.com/playlist?list=$listid"
-  folder_name=$(yt-dlp --flat-playlist --playlist-items 1 --print "%(playlist_title)s" "$playlist_url" 2>/dev/null | head -n 1)
+  folder_name=$(yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --playlist-items 1 --print "%(playlist_title)s" "$playlist_url" 2>/dev/null | head -n 1)
   if [ -z "$folder_name" ]; then
     log "playlist non raggiungibile ora: $playlist_url"
     UNREACHABLE=$((UNREACHABLE + 1)); continue
@@ -147,7 +142,7 @@ while IFS= read -r raw_line; do
   # FASE 0 — RIPRISTINO dalla _RIMOSSI GENERALE
   if [ -d "$REMOVED_FOLDER" ]; then
     CUR0=$(mktemp)
-    yt-dlp --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR0"
+    yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR0"
     if [ -s "$CUR0" ]; then
       for file in "$REMOVED_FOLDER"/*.mp3; do
         [ ! -e "$file" ] && continue
@@ -164,23 +159,31 @@ while IFS= read -r raw_line; do
     rm -f "$CUR0"
   fi
 
-  # FASE 1 — DOWNLOAD nuovi
+  # FASE 1 — DOWNLOAD nuovi (errori yt-dlp catturati e contati)
   cd "$playlist_folder" || continue
   before=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
+  ERRLOG=$(mktemp)
   yt-dlp \
     --yes-playlist --ignore-errors --no-overwrites \
+    "${YT_NET_OPTS[@]}" \
     --extract-audio --audio-format mp3 --audio-quality 0 \
     --embed-thumbnail --add-metadata \
     --download-archive "$ARCHIVE_FILE" \
     --output "%(title)s [%(id)s].%(ext)s" \
-    "$playlist_url"
+    "$playlist_url" 2>"$ERRLOG"
+  dlerr=$(grep -c '^ERROR:' "$ERRLOG" 2>/dev/null)
+  rm -f "$ERRLOG"
+  if [ "${dlerr:-0}" -gt 0 ]; then
+    log "   $dlerr video non scaricabili in \"$folder_name\" (rimossi/privati o throttling)"
+    TOTAL_DLERR=$((TOTAL_DLERR + dlerr))
+  fi
   after=$(ls -1 *.mp3 2>/dev/null | wc -l | tr -d ' ')
   new=$((after - before))
   if [ "$new" -gt 0 ]; then ANY_NEW=true; log "nuovi in \"$folder_name\": $new"; fi
 
   # FASE 2 — RIMOZIONI -> _RIMOSSI GENERALE
   CUR=$(mktemp)
-  yt-dlp --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR"
+  yt-dlp "${YT_META_OPTS[@]}" --flat-playlist --print "%(id)s" "$playlist_url" 2>/dev/null > "$CUR"
   ids_count=$(grep -cvE '^\s*$' "$CUR")
   if [ "$ids_count" -eq 0 ]; then
     log "AVVISO lettura \"$folder_name\" a 0 brani: rimozioni SALTATE per sicurezza."
@@ -212,7 +215,7 @@ END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 DMIN=$((DURATION / 60)); DSEC=$((DURATION % 60))
 log "durata: ${DMIN}m ${DSEC}s"
 
-SUMMARY="Sync OK — playlist:$VALID_PLAYLISTS, nuovi:$ANY_NEW, rimossi:$TOTAL_REMOVED, ripristinati:$TOTAL_RESTORED, righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
+SUMMARY="Sync OK — playlist:$VALID_PLAYLISTS, nuovi:$ANY_NEW, rimossi:$TOTAL_REMOVED, ripristinati:$TOTAL_RESTORED, video_falliti:$TOTAL_DLERR, righe_saltate:$SKIPPED_LINES, non_raggiungibili:$UNREACHABLE (${DMIN}m${DSEC}s)"
 [ "$UNREACHABLE" -gt 0 ] && SUMMARY="ATTENZIONE $SUMMARY"
 log "fine — $SUMMARY"
 echo "----------------------------------------" >> "$LOG_FILE"
