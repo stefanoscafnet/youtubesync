@@ -1,18 +1,19 @@
 #!/bin/bash
 # ============================================================
-# YouTubeSync v10 — ScafNet
-# NOVITA' rispetto alla v9:
-#  1) Meno errori da YouTube: aggiunti --retries, --fragment-retries,
-#     --extractor-retries e --sleep-requests (micro-pausa tra le
-#     richieste). Riduce i 403/429 e le playlist "non raggiungibili".
-#  2) Errori yt-dlp nel LOG del foglio: per ogni playlist viene
-#     contato quanti video non si sono potuti scaricare (rimossi/
-#     privati o throttling) e il totale finisce nel riepilogo.
-#     Cosi' Stefano li vede da remoto senza guardare il terminale.
+# YouTubeSync v11 — ScafNet
+# NOVITA' rispetto alla v10 (fix della causa vera dei rallentamenti
+# e dei "video falliti"):
+#  1) RIALLINEAMENTO ARCHIVIO: all'avvio lo script legge gli ID dai
+#     nomi dei file MP3 gia' presenti ([xxxxxxxxxxx].mp3) e li scrive
+#     nell'archivio. Cosi' yt-dlp salta per ID (prima di toccare la
+#     rete) tutto cio' che e' gia' scaricato, anche se il TITOLO del
+#     video e' cambiato. Il sync diventa di secondi e sparisce il
+#     throttling che generava i "video falliti".
+#  2) RIMOSSO --sleep-requests: non serve piu' (pochissime richieste).
+#     Tenuti i retry e il conteggio video_falliti.
 #
-# Resto come v9: AUTO-AGGIORNANTE da GitHub, lista playlist da web
-# app GAS (con cache), _RIMOSSI unica generale, nomi con ID,
-# config locale (ENDPOINT_URL in config.sh), notifiche tranquille.
+# Resto come v10: AUTO-AGGIORNANTE da GitHub, lista da web app GAS
+# (con cache), _RIMOSSI unica, config locale (config.sh), ecc.
 # ============================================================
 
 GHRAW="https://raw.githubusercontent.com/stefanoscafnet/youtubesync/main/sync-from-playlist.command"
@@ -51,8 +52,8 @@ PLAYLIST_LOCAL="$HOME/Desktop/playlist.txt"
 REMOVED_DIRNAME="_RIMOSSI"
 REMOVED_FOLDER="$DEST_FOLDER/$REMOVED_DIRNAME"
 
-# Opzioni yt-dlp per ridurre gli errori di rete/throttling
-YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3 --sleep-requests 1)
+# Opzioni yt-dlp (retry per robustezza; niente sleep: ora si scarica poco)
+YT_NET_OPTS=(--retries 5 --fragment-retries 5 --extractor-retries 3)
 YT_META_OPTS=(--retries 5 --extractor-retries 3)
 
 # --- STATO ---
@@ -70,8 +71,15 @@ log() {
   echo "$line" >> "$RUN_LOG"
 }
 
+extract_id_from_filename() {
+  local name="$1"
+  if [[ "$name" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
 osascript -e 'display notification "Sincronizzazione in corso..." with title "YouTubeSync" sound name "Submarine"'
-log "inizio sincronizzazione (v10)"
+log "inizio sincronizzazione (v11)"
 
 # --- CHECK DIPENDENZE ---
 if ! command -v yt-dlp >/dev/null 2>&1; then
@@ -85,6 +93,25 @@ fi
 if ! command -v deno >/dev/null 2>&1; then
   log "AVVISO deno non trovato — alcuni video potrebbero fallire (JS challenge)"
 fi
+
+# --- RIALLINEAMENTO ARCHIVIO DAI FILE GIA' PRESENTI ---
+# Per ogni MP3 con ID nel nome (escluse le _RIMOSSI) assicura che
+# "youtube <id>" sia nell'archivio, cosi' yt-dlp lo salta per ID.
+touch "$ARCHIVE_FILE"
+EXIST_IDS=$(mktemp); ARCH_IDS=$(mktemp)
+find "$DEST_FOLDER" -type f -name "*].mp3" ! -path "$REMOVED_FOLDER/*" 2>/dev/null \
+  | grep -oE '\[[A-Za-z0-9_-]{11}\]\.mp3$' | sed -E 's/^\[//; s/\]\.mp3$//' | sort -u > "$EXIST_IDS"
+awk '/^youtube /{print $2}' "$ARCHIVE_FILE" | sort -u > "$ARCH_IDS"
+added=0
+while IFS= read -r id; do
+  [ -z "$id" ] && continue
+  if ! grep -qx "$id" "$ARCH_IDS"; then
+    echo "youtube $id" >> "$ARCHIVE_FILE"
+    added=$((added + 1))
+  fi
+done < "$EXIST_IDS"
+rm -f "$EXIST_IDS" "$ARCH_IDS"
+[ "$added" -gt 0 ] && log "archivio riallineato: +$added id dai file esistenti"
 
 # --- SCARICA LA LISTA PLAYLIST DAL WEB APP (con fallback a cache) ---
 PLAYLIST_FILE=""
@@ -111,13 +138,6 @@ if [ -z "$PLAYLIST_FILE" ]; then
   [ -n "$ENDPOINT_URL" ] && curl -fsS -X POST "$ENDPOINT_URL" --data-urlencode "summary=ERRORE: nessuna lista playlist" --data-urlencode "detail@$RUN_LOG" >/dev/null 2>&1
   rm -f "$RUN_LOG"; exit 1
 fi
-
-extract_id_from_filename() {
-  local name="$1"
-  if [[ "$name" =~ \[([A-Za-z0-9_-]{11})\]\.mp3$ ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  fi
-}
 
 # --- LOOP PLAYLIST ---
 while IFS= read -r raw_line; do
